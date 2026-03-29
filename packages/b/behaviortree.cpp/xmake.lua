@@ -52,8 +52,13 @@ package("behaviortree.cpp")
         end
     end)
 
-
     on_install(function (package)
+        -- patch missing <vector> include for NDK 22 libc++ compatibility
+        io.replace("include/behaviortree_cpp/utils/polymorphic_cast_registry.hpp",
+            "#pragma once",
+            "#pragma once\n#include <vector>",
+            {plain = true})
+
         local configs = {
             -- Block ament/ROS2 auto-detection
             "-Dament_cmake_FOUND=FALSE",
@@ -71,6 +76,27 @@ package("behaviortree.cpp")
             "-DUSE_VENDORED_TINYXML2=" .. (package:config("vendored") and "ON" or "OFF"),
             "-DUSE_VENDORED_CPPZMQ=" .. (package:config("vendored") and "ON" or "OFF")
         }
+
+        -- Help CMake's FindZeroMQ locate the xmake-installed zeromq.
+        -- cppzmq's bundled cppzmqConfig.cmake calls find_package(ZeroMQ) internally,
+        -- which uses FindZeroMQ.cmake and won't find xmake's package cache on its own.
+        if package:config("groot2_interface") then
+            local zeromq = package:dep("zeromq")
+            if zeromq then
+                local fetchinfo = zeromq:fetch()
+                if fetchinfo then
+                    local includedirs = fetchinfo.sysincludedirs or fetchinfo.includedirs
+                    local libfiles = fetchinfo.libfiles
+                    if includedirs and #includedirs > 0 then
+                        table.insert(configs, "-DZMQ_INCLUDE_DIR=" .. includedirs[1])
+                    end
+                    if libfiles and #libfiles > 0 then
+                        table.insert(configs, "-DZMQ_LIBRARY=" .. libfiles[1])
+                    end
+                end
+            end
+        end
+
         import("package.tools.cmake").install(package, configs)
     end)
 
