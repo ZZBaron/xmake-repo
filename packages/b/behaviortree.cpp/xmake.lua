@@ -29,7 +29,6 @@ package("behaviortree.cpp")
         type = "boolean"
     })
 
-    -- BT.CPP uses dlopen on Unix for plugin loading
     if is_plat("linux", "bsd") then
         add_syslinks("pthread", "dl")
     end
@@ -60,11 +59,10 @@ package("behaviortree.cpp")
             {plain = true})
 
         local configs = {
-            -- Block ament/ROS2 auto-detection
             "-Dament_cmake_FOUND=FALSE",
             "-DBUILD_TESTING=OFF",
             "-DBTCPP_EXAMPLES=OFF",
-            "-DUSE_VENDORED_FLATBUFFERS=ON", -- vendored flatbuffers only includes base.h
+            "-DUSE_VENDORED_FLATBUFFERS=ON",
             "-DUSE_VENDORED_MINICORO=ON",
             "-DCMAKE_BUILD_TYPE=" .. (package:is_debug() and "Debug" or "Release"),
             "-DBUILD_SHARED_LIBS=" .. (package:config("shared") and "ON" or "OFF"),
@@ -74,21 +72,34 @@ package("behaviortree.cpp")
             "-DBTCPP_BUILD_TOOLS=" .. (package:config("tools") and "ON" or "OFF"),
             "-DUSE_VENDORED_MINITRACE=" .. (package:config("vendored") and "ON" or "OFF"),
             "-DUSE_VENDORED_TINYXML2=" .. (package:config("vendored") and "ON" or "OFF"),
-            "-DUSE_VENDORED_CPPZMQ=" .. (package:config("vendored") and "ON" or "OFF")
+            "-DUSE_VENDORED_CPPZMQ=" .. (package:config("vendored") and "ON" or "OFF"),
         }
 
-        -- cppzmq's bundled cppzmqConfig.cmake calls find_package(ZeroMQ REQUIRED)
-        -- using its own FindZeroMQ.cmake, which won't find xmake's package cache
-        -- on its own (especially on Windows where pkg-config is absent).
-        -- CMAKE_PREFIX_PATH makes all find_* calls search under that prefix,
-        -- and ZeroMQ_ROOT is the direct hint FindZeroMQ.cmake checks.
         if package:config("groot2_interface") then
             local zeromq = package:dep("zeromq")
+            local cppzmq = package:dep("cppzmq")
             if zeromq then
-                local installdir = zeromq:installdir()
+                local fetchinfo = zeromq:fetch()
+                if fetchinfo then
+                    local includedirs = fetchinfo.sysincludedirs or fetchinfo.includedirs
+                    local libfiles = fetchinfo.libfiles
+                    -- Pre-set FindZeroMQ.cmake output variables so the search is
+                    -- skipped; needed because the lib has a versioned name on Windows
+                    -- (libzmq-mt-s-4_3_5.lib) that generic find_library won't match
+                    if includedirs and #includedirs > 0 then
+                        table.insert(configs, "-DZeroMQ_INCLUDE_DIRS=" .. includedirs[1])
+                    end
+                    if libfiles and #libfiles > 0 then
+                        table.insert(configs, "-DZeroMQ_LIBRARIES=" .. table.concat(libfiles, ";"))
+                    end
+                end
+            end
+            -- Point CMake at the xmake-installed cppzmq cmake config dir so
+            -- find_package(cppzmq) picks up the right one
+            if cppzmq then
+                local installdir = cppzmq:installdir()
                 if installdir then
-                    table.insert(configs, "-DCMAKE_PREFIX_PATH=" .. installdir)
-                    table.insert(configs, "-DZeroMQ_ROOT=" .. installdir)
+                    table.insert(configs, "-Dcppzmq_DIR=" .. path.join(installdir, "share", "cmake", "cppzmq"))
                 end
             end
         end
