@@ -83,19 +83,22 @@ package("behaviortree.cpp")
                 if fetchinfo then
                     local includedirs = fetchinfo.sysincludedirs or fetchinfo.includedirs
                     local libfiles = fetchinfo.libfiles
-                    -- Pre-set FindZeroMQ.cmake output variables so the search is
-                    -- skipped; needed because the lib has a versioned name on Windows
-                    -- (libzmq-mt-s-4_3_5.lib) that generic find_library won't match
                     if includedirs and #includedirs > 0 then
                         table.insert(configs, "-DZeroMQ_INCLUDE_DIRS=" .. includedirs[1])
                     end
                     if libfiles and #libfiles > 0 then
-                        table.insert(configs, "-DZeroMQ_LIBRARIES=" .. table.concat(libfiles, ";"))
+                        local libfile = libfiles[1]
+                        -- ZeroMQ_LIBRARIES: output var checked by find_package_handle_standard_args
+                        -- ZeroMQ_LIBRARY: singular form used by cppzmq's imported target to set
+                        --                 INTERFACE_LINK_LIBRARIES; must be a full path or CMake
+                        --                 falls back to -l<name> which becomes -llibzmq on Linux
+                        table.insert(configs, "-DZeroMQ_LIBRARIES=" .. libfile)
+                        table.insert(configs, "-DZeroMQ_LIBRARY=" .. libfile)
                     end
                 end
             end
-            -- Point CMake at the xmake-installed cppzmq cmake config dir so
-            -- find_package(cppzmq) picks up the right one
+            -- Point find_package(cppzmq) at the xmake-installed config dir so the
+            -- imported target cppzmq-static/cppzmq gets fully resolved with paths
             if cppzmq then
                 local installdir = cppzmq:installdir()
                 if installdir then
