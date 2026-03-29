@@ -77,22 +77,18 @@ package("behaviortree.cpp")
             "-DUSE_VENDORED_CPPZMQ=" .. (package:config("vendored") and "ON" or "OFF")
         }
 
-        -- Help CMake's FindZeroMQ locate the xmake-installed zeromq.
-        -- cppzmq's bundled cppzmqConfig.cmake calls find_package(ZeroMQ) internally,
-        -- which uses FindZeroMQ.cmake and won't find xmake's package cache on its own.
+        -- cppzmq's bundled cppzmqConfig.cmake calls find_package(ZeroMQ REQUIRED)
+        -- using its own FindZeroMQ.cmake, which won't find xmake's package cache
+        -- on its own (especially on Windows where pkg-config is absent).
+        -- CMAKE_PREFIX_PATH makes all find_* calls search under that prefix,
+        -- and ZeroMQ_ROOT is the direct hint FindZeroMQ.cmake checks.
         if package:config("groot2_interface") then
             local zeromq = package:dep("zeromq")
             if zeromq then
-                local fetchinfo = zeromq:fetch()
-                if fetchinfo then
-                    local includedirs = fetchinfo.sysincludedirs or fetchinfo.includedirs
-                    local libfiles = fetchinfo.libfiles
-                    if includedirs and #includedirs > 0 then
-                        table.insert(configs, "-DZMQ_INCLUDE_DIR=" .. includedirs[1])
-                    end
-                    if libfiles and #libfiles > 0 then
-                        table.insert(configs, "-DZMQ_LIBRARY=" .. libfiles[1])
-                    end
+                local installdir = zeromq:installdir()
+                if installdir then
+                    table.insert(configs, "-DCMAKE_PREFIX_PATH=" .. installdir)
+                    table.insert(configs, "-DZeroMQ_ROOT=" .. installdir)
                 end
             end
         end
