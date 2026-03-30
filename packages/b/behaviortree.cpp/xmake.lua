@@ -40,7 +40,10 @@ package("behaviortree.cpp")
             package:add("deps", "tinyxml2")
             package:add("deps", "minitrace")
         end
-        if package:config("groot2_interface") then
+        -- ZeroMQ / Groot2 is not supported on WASM (no sockets) and the
+        -- minicoro fiber backend it pulls in breaks Emscripten compilation.
+        local groot2 = package:config("groot2_interface")
+        if groot2 and not package:is_plat("wasm") then
             package:add("deps", "zeromq")
         end
         if package:config("sqlite_logging") then
@@ -55,15 +58,27 @@ package("behaviortree.cpp")
             "#pragma once\n#include <vector>",
             {plain = true})
 
-        -- Android API < 24 (armv7 targets API 21) does not expose fseeko/ftello.
-        -- libc++'s <fstream> calls these when _FILE_OFFSET_BITS=64 is defined.
-        -- Undefine that macro before the header is pulled in.
+        -- Android API 21 (armv7) libc does not expose fseeko/ftello.
+        -- Passing _FILE_OFFSET_BITS=32 to the CMake build suppresses the
+        -- 64-bit file-offset path in libc++ <fstream> that calls these.
+        -- We cannot simply #undef in the source because the NDK sysroot
+        -- headers gate fseeko on __ANDROID_API__ >= 24 regardless of the
+        -- macro; removing the define entirely makes libc++ fall back to the
+        -- 32-bit fseek/ftell path that API 21 does have.
+        local extra_cxxflags = ""
         if package:is_plat("android") then
-            io.replace("src/loggers/bt_file_logger_v2.cpp",
-                "#include <fstream>",
-                "#undef _FILE_OFFSET_BITS\n#include <fstream>",
-                {plain = true})
+            extra_cxxflags = "-U_FILE_OFFSET_BITS"
         end
+
+        -- WASM: minicoro's Emscripten path selects MCO_USE_FIBERS which
+        -- includes emscripten/fiber.h inside an extern "C" block, breaking
+        -- C++ template declarations. Force the asyncify backend instead,
+        -- which avoids fiber.h entirely.
+        if package:is_plat("wasm") then
+            extra_cxxflags = (extra_cxxflags ~= "" and extra_cxxflags .. " " or "") .. "-DMCO_USE_ASYNCIFY"
+        end
+
+        local groot2_enabled = package:config("groot2_interface") and not package:is_plat("wasm")
 
         local configs = {
             "-Dament_cmake_FOUND=FALSE",
@@ -74,18 +89,22 @@ package("behaviortree.cpp")
             "-DCMAKE_BUILD_TYPE=" .. (package:is_debug() and "Debug" or "Release"),
             "-DBUILD_SHARED_LIBS=" .. (package:config("shared") and "ON" or "OFF"),
             "-DBTCPP_SHARED_LIBS=" .. (package:config("shared") and "ON" or "OFF"),
-            "-DBTCPP_GROOT_INTERFACE=" .. (package:config("groot2_interface") and "ON" or "OFF"),
+            "-DBTCPP_GROOT_INTERFACE=" .. (groot2_enabled and "ON" or "OFF"),
             "-DBTCPP_SQLITE_LOGGING=" .. (package:config("sqlite_logging") and "ON" or "OFF"),
             "-DBTCPP_BUILD_TOOLS=" .. (package:config("tools") and "ON" or "OFF"),
             "-DUSE_VENDORED_MINITRACE=" .. (package:config("vendored") and "ON" or "OFF"),
             "-DUSE_VENDORED_TINYXML2=" .. (package:config("vendored") and "ON" or "OFF"),
             -- Always use the vendored cppzmq (header-only). Its CMakeLists.txt
-            -- requires a libzmq-static or libzmq CMake target; we create that
-            -- via CMAKE_PROJECT_INCLUDE below.
+            -- requires a libzmq-static or libzmq CMake target; we inject that
+            -- via CMAKE_PROJECT_INCLUDE below when groot2 is enabled.
             "-DUSE_VENDORED_CPPZMQ=ON",
         }
 
-        if package:config("groot2_interface") then
+        if extra_cxxflags ~= "" then
+            table.insert(configs, "-DCMAKE_CXX_FLAGS=" .. extra_cxxflags)
+        end
+
+        if groot2_enabled then
             local zeromq = package:dep("zeromq")
             if zeromq then
                 local fetchinfo = zeromq:fetch()
@@ -116,29 +135,23 @@ package("behaviortree.cpp")
                     -- creates those targets, so we inject a small CMake file via
                     -- CMAKE_PROJECT_INCLUDE that runs before any subdirectory.
                     --
-                    -- The injected target must carry:
-                    --   INTERFACE_COMPILE_DEFINITIONS ZMQ_STATIC
-                    --     Without this, zmq.hpp emits __declspec(dllimport)
-                    --     decorated symbol names (__imp_zmq_*) that the static
-                    --     lib does not export → LNK2019 on Windows.
-                    --   INTERFACE_LINK_LIBRARIES (Windows syslibs)
-                    --     The static libzmq archive on Windows needs ws2_32,
-                    --     iphlpapi, advapi32, rpcrt4 at the final link step.
-                    --     Without these the linker cannot resolve WSAStartup,
-                    --     GetAdaptersAddresses, etc. → LNK2019 on Windows.
+                    -- INTERFACE_COMPILE_DEFINITIONS ZMQ_STATIC:
+                    --   Without this, zmq.hpp emits __declspec(dllimport)
+                    --   decorated names (__imp_zmq_*) → LNK2019 on Windows/MinGW.
+                    -- INTERFACE_LINK_LIBRARIES (Windows/MinGW syslibs):
+                    --   The static libzmq archive needs ws2_32, iphlpapi etc.
+                    --   at link time on all Windows-like platforms (MSVC + MinGW).
                     if zmq_libfile ~= "" then
                         local zmq_libfile_cmake = zmq_libfile:gsub("\\", "/")
                         local zmq_include_cmake = zmq_include:gsub("\\", "/")
 
-                        -- Collect Windows syslinks from fetchinfo so we use
-                        -- exactly what the xmake zeromq package declares.
+                        -- Collect syslinks for both MSVC (windows) and MinGW (mingw).
                         local win_syslinks = ""
-                        if package:is_plat("windows") then
+                        if package:is_plat("windows", "mingw") then
                             local syslinks = fetchinfo.syslinks
                             if syslinks and #syslinks > 0 then
                                 win_syslinks = table.concat(syslinks, ";")
                             else
-                                -- Fallback: these are the standard zeromq deps.
                                 win_syslinks = "ws2_32;advapi32;rpcrt4;iphlpapi"
                             end
                         end
@@ -153,12 +166,7 @@ if(NOT TARGET libzmq-static)
         IMPORTED_LOCATION "%s"
         INTERFACE_INCLUDE_DIRECTORIES "%s"
         IMPORTED_LINK_INTERFACE_LANGUAGES "CXX"
-        # ZMQ_STATIC: tell zmq.hpp to use plain symbol names, not
-        # __declspec(dllimport) decorated ones (__imp_zmq_*).
         INTERFACE_COMPILE_DEFINITIONS "ZMQ_STATIC"
-        # Windows syslibs: the static zmq archive needs these at link time.
-        # Without them CMake leaves ws2_32, iphlpapi etc. off the link line
-        # and produces LNK2019 for WSAStartup, GetAdaptersAddresses, etc.
         INTERFACE_LINK_LIBRARIES "%s"
     )
 endif()
