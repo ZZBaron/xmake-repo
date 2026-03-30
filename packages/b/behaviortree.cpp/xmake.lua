@@ -56,11 +56,8 @@ package("behaviortree.cpp")
             {plain = true})
 
         -- Android API < 24 (armv7 targets API 21) does not expose fseeko/ftello.
-        -- The file logger uses <fstream> which internally calls these via libc++.
-        -- Fix: undefine _FILE_OFFSET_BITS before the offending header is pulled in.
-        -- The define is injected by CMake's -D_FILE_OFFSET_BITS=64 flag which comes
-        -- from a cmake policy; removing it restores the 32-bit off_t path that
-        -- Android 21 does have.
+        -- libc++'s <fstream> calls these when _FILE_OFFSET_BITS=64 is defined.
+        -- Undefine that macro before the header is pulled in.
         if package:is_plat("android") then
             io.replace("src/loggers/bt_file_logger_v2.cpp",
                 "#include <fstream>",
@@ -83,8 +80,8 @@ package("behaviortree.cpp")
             "-DUSE_VENDORED_MINITRACE=" .. (package:config("vendored") and "ON" or "OFF"),
             "-DUSE_VENDORED_TINYXML2=" .. (package:config("vendored") and "ON" or "OFF"),
             -- Always use the vendored cppzmq (header-only). Its CMakeLists.txt
-            -- requires a `libzmq-static` or `libzmq` CMake target; we create
-            -- that via CMAKE_PROJECT_INCLUDE below.
+            -- requires a libzmq-static or libzmq CMake target; we create that
+            -- via CMAKE_PROJECT_INCLUDE below.
             "-DUSE_VENDORED_CPPZMQ=ON",
         }
 
@@ -105,32 +102,46 @@ package("behaviortree.cpp")
                     end
                     if zmq_libfile ~= "" then
                         -- ZeroMQ_FOUND=TRUE makes FindZeroMQ.cmake take its
-                        -- early-exit branch: sets ZeroMQ_LIBRARIES from the full
-                        -- path without running find_library() (which would add a
-                        -- bare -lzmq/-llibzmq flag alongside the full-path archive).
+                        -- early-exit branch: sets ZeroMQ_LIBRARIES from the
+                        -- full path without running find_library(), avoiding a
+                        -- bare -lzmq/-llibzmq flag alongside the full-path lib.
                         table.insert(configs, "-DZeroMQ_FOUND=TRUE")
                         table.insert(configs, "-DZeroMQ_LIBRARIES=" .. zmq_libfile)
                         table.insert(configs, "-DZeroMQ_LIBRARY=" .. zmq_libfile)
                     end
 
                     -- 3rdparty/cppzmq/CMakeLists.txt calls find_package(ZeroMQ)
-                    -- then does if(TARGET libzmq-static) / elseif(TARGET libzmq)
-                    -- and fatals if neither exists. FindZeroMQ.cmake's early-exit
-                    -- path never creates those targets, so we inject a small file
-                    -- via CMAKE_PROJECT_INCLUDE that runs before any subdirectory
-                    -- and creates `libzmq-static` as a full-path IMPORTED target.
+                    -- then checks TARGET libzmq-static / libzmq and fatals if
+                    -- neither exists. FindZeroMQ.cmake's early-exit path never
+                    -- creates those targets, so we inject a small CMake file via
+                    -- CMAKE_PROJECT_INCLUDE that runs before any subdirectory.
                     --
-                    -- Crucially we also set INTERFACE_COMPILE_DEFINITIONS=ZMQ_STATIC
-                    -- on the target. Without this, zmq.hpp on Windows emits
-                    -- __declspec(dllimport) decorated symbol names (__imp_zmq_*)
-                    -- which the static library does not export, causing LNK2019.
-                    -- The xmake zeromq package sets defines="ZMQ_STATIC" in its
-                    -- fetchinfo but that is never propagated into the CMake build;
-                    -- attaching it to the imported target propagates it correctly
-                    -- to every consumer of `cppzmq` / `libzmq-static`.
+                    -- The injected target must carry:
+                    --   INTERFACE_COMPILE_DEFINITIONS ZMQ_STATIC
+                    --     Without this, zmq.hpp emits __declspec(dllimport)
+                    --     decorated symbol names (__imp_zmq_*) that the static
+                    --     lib does not export → LNK2019 on Windows.
+                    --   INTERFACE_LINK_LIBRARIES (Windows syslibs)
+                    --     The static libzmq archive on Windows needs ws2_32,
+                    --     iphlpapi, advapi32, rpcrt4 at the final link step.
+                    --     Without these the linker cannot resolve WSAStartup,
+                    --     GetAdaptersAddresses, etc. → LNK2019 on Windows.
                     if zmq_libfile ~= "" then
                         local zmq_libfile_cmake = zmq_libfile:gsub("\\", "/")
                         local zmq_include_cmake = zmq_include:gsub("\\", "/")
+
+                        -- Collect Windows syslinks from fetchinfo so we use
+                        -- exactly what the xmake zeromq package declares.
+                        local win_syslinks = ""
+                        if package:is_plat("windows") then
+                            local syslinks = fetchinfo.syslinks
+                            if syslinks and #syslinks > 0 then
+                                win_syslinks = table.concat(syslinks, ";")
+                            else
+                                -- Fallback: these are the standard zeromq deps.
+                                win_syslinks = "ws2_32;advapi32;rpcrt4;iphlpapi"
+                            end
+                        end
 
                         local init_file = "btcpp_zmq_targets.cmake"
                         io.writefile(init_file, string.format([[
@@ -142,17 +153,19 @@ if(NOT TARGET libzmq-static)
         IMPORTED_LOCATION "%s"
         INTERFACE_INCLUDE_DIRECTORIES "%s"
         IMPORTED_LINK_INTERFACE_LANGUAGES "CXX"
-        # ZMQ_STATIC tells zmq.hpp to use plain symbol names instead of
-        # __declspec(dllimport) decorated names.  Without this, linking a
-        # shared library against the static zmq archive fails with LNK2019
-        # unresolved __imp_zmq_* on Windows (and equivalent issues elsewhere).
+        # ZMQ_STATIC: tell zmq.hpp to use plain symbol names, not
+        # __declspec(dllimport) decorated ones (__imp_zmq_*).
         INTERFACE_COMPILE_DEFINITIONS "ZMQ_STATIC"
+        # Windows syslibs: the static zmq archive needs these at link time.
+        # Without them CMake leaves ws2_32, iphlpapi etc. off the link line
+        # and produces LNK2019 for WSAStartup, GetAdaptersAddresses, etc.
+        INTERFACE_LINK_LIBRARIES "%s"
     )
 endif()
 if(NOT TARGET libzmq)
     add_library(libzmq ALIAS libzmq-static)
 endif()
-]], zmq_libfile_cmake, zmq_include_cmake))
+]], zmq_libfile_cmake, zmq_include_cmake, win_syslinks))
 
                         table.insert(configs, "-DCMAKE_PROJECT_INCLUDE=" ..
                             path.absolute(init_file):gsub("\\", "/"))
