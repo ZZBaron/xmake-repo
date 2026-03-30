@@ -42,10 +42,6 @@ package("behaviortree.cpp")
         end
         if package:config("groot2_interface") then
             package:add("deps", "zeromq")
-            -- cppzmq is header-only; always use the vendored copy bundled with
-            -- BehaviorTree.CPP so we never get a cppzmq CMake imported target
-            -- whose INTERFACE_LINK_LIBRARIES contains the bare name "libzmq",
-            -- which the linker would expand to -llibzmq and fail to find.
         end
         if package:config("sqlite_logging") then
             package:add("deps", "sqlite3")
@@ -73,13 +69,9 @@ package("behaviortree.cpp")
             "-DBTCPP_BUILD_TOOLS=" .. (package:config("tools") and "ON" or "OFF"),
             "-DUSE_VENDORED_MINITRACE=" .. (package:config("vendored") and "ON" or "OFF"),
             "-DUSE_VENDORED_TINYXML2=" .. (package:config("vendored") and "ON" or "OFF"),
-            -- Always use the vendored cppzmq. cppzmq is header-only so there is
-            -- no binary to worry about. This prevents CMake from locating an
-            -- installed cppzmq config file whose imported target carries
-            -- INTERFACE_LINK_LIBRARIES = "libzmq" (a bare name). That bare name
-            -- becomes -llibzmq on the final link line alongside the full-path
-            -- archive already provided via ZeroMQ_LIBRARY, causing LNK1181 on
-            -- Windows and "cannot find -llibzmq" on Linux.
+            -- Always use the vendored cppzmq (header-only).
+            -- Its CMakeLists.txt requires a `libzmq-static` or `libzmq` CMake
+            -- target; we create that via CMAKE_PROJECT_INCLUDE below.
             "-DUSE_VENDORED_CPPZMQ=ON",
         }
 
@@ -90,24 +82,60 @@ package("behaviortree.cpp")
                 if fetchinfo then
                     local includedirs = fetchinfo.sysincludedirs or fetchinfo.includedirs
                     local libfiles = fetchinfo.libfiles
-                    if includedirs and #includedirs > 0 then
-                        table.insert(configs, "-DZeroMQ_INCLUDE_DIRS=" .. includedirs[1])
-                        -- ZeroMQ_INCLUDE_DIR (singular) is the cache variable used by
-                        -- FindZeroMQ.cmake's short-circuit path to populate
-                        -- ZeroMQ_INCLUDE_DIRS, so set both forms.
-                        table.insert(configs, "-DZeroMQ_INCLUDE_DIR=" .. includedirs[1])
+
+                    local zmq_include = (includedirs and #includedirs > 0) and includedirs[1] or ""
+                    local zmq_libfile = (libfiles and #libfiles > 0) and libfiles[1] or ""
+
+                    if zmq_include ~= "" then
+                        table.insert(configs, "-DZeroMQ_INCLUDE_DIRS=" .. zmq_include)
+                        table.insert(configs, "-DZeroMQ_INCLUDE_DIR=" .. zmq_include)
                     end
-                    if libfiles and #libfiles > 0 then
-                        local libfile = libfiles[1]
-                        -- Pass the full path via both variables consumed by
-                        -- FindZeroMQ.cmake.  Setting ZeroMQ_FOUND=TRUE makes the
-                        -- module take its early-exit branch (lines 16-19), which
-                        -- sets ZeroMQ_LIBRARIES = ZeroMQ_LIBRARY (full path) and
-                        -- skips the find_library() call that would otherwise fall
-                        -- back to a bare "-lzmq" / "-llibzmq" flag.
+                    if zmq_libfile ~= "" then
+                        -- ZeroMQ_FOUND=TRUE makes FindZeroMQ.cmake take its
+                        -- early-exit branch: sets ZeroMQ_LIBRARIES=ZeroMQ_LIBRARY
+                        -- (full path) and skips find_library(), avoiding any
+                        -- bare -lzmq/-llibzmq flag on the final link line.
                         table.insert(configs, "-DZeroMQ_FOUND=TRUE")
-                        table.insert(configs, "-DZeroMQ_LIBRARIES=" .. libfile)
-                        table.insert(configs, "-DZeroMQ_LIBRARY=" .. libfile)
+                        table.insert(configs, "-DZeroMQ_LIBRARIES=" .. zmq_libfile)
+                        table.insert(configs, "-DZeroMQ_LIBRARY=" .. zmq_libfile)
+                    end
+
+                    -- 3rdparty/cppzmq/CMakeLists.txt calls find_package(ZeroMQ)
+                    -- then checks `if(TARGET libzmq-static)` / `elseif(TARGET
+                    -- libzmq)` and fatals if neither exists.  FindZeroMQ.cmake's
+                    -- early-exit path (triggered by ZeroMQ_FOUND=TRUE above)
+                    -- never creates those targets.  We write a small CMake file
+                    -- and pass it via CMAKE_PROJECT_INCLUDE, which CMake runs
+                    -- once right after the top-level project() call and before
+                    -- any add_subdirectory(), so the target is globally visible
+                    -- when cppzmq's CMakeLists.txt runs.
+                    --
+                    -- The init file is written into the source tree so its path
+                    -- is guaranteed free of spaces and CMake-unsafe characters.
+                    if zmq_libfile ~= "" then
+                        local zmq_libfile_cmake = zmq_libfile:gsub("\\", "/")
+                        local zmq_include_cmake = zmq_include:gsub("\\", "/")
+
+                        -- Write next to CMakeLists.txt so the path is simple.
+                        local init_file = "btcpp_zmq_targets.cmake"
+                        io.writefile(init_file, string.format([[
+# Auto-generated by the xmake behaviortree.cpp package.
+# Creates the imported target required by 3rdparty/cppzmq/CMakeLists.txt.
+if(NOT TARGET libzmq-static)
+    add_library(libzmq-static STATIC IMPORTED GLOBAL)
+    set_target_properties(libzmq-static PROPERTIES
+        IMPORTED_LOCATION "%s"
+        INTERFACE_INCLUDE_DIRECTORIES "%s"
+        IMPORTED_LINK_INTERFACE_LANGUAGES "CXX"
+    )
+endif()
+if(NOT TARGET libzmq)
+    add_library(libzmq ALIAS libzmq-static)
+endif()
+]], zmq_libfile_cmake, zmq_include_cmake))
+
+                        table.insert(configs, "-DCMAKE_PROJECT_INCLUDE=" ..
+                            path.absolute(init_file):gsub("\\", "/"))
                     end
                 end
             end
