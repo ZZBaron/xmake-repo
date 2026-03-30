@@ -42,9 +42,10 @@ package("behaviortree.cpp")
         end
         if package:config("groot2_interface") then
             package:add("deps", "zeromq")
-            if not package:config("vendored") then
-                package:add("deps", "cppzmq")
-            end
+            -- cppzmq is header-only; always use the vendored copy bundled with
+            -- BehaviorTree.CPP so we never get a cppzmq CMake imported target
+            -- whose INTERFACE_LINK_LIBRARIES contains the bare name "libzmq",
+            -- which the linker would expand to -llibzmq and fail to find.
         end
         if package:config("sqlite_logging") then
             package:add("deps", "sqlite3")
@@ -72,12 +73,18 @@ package("behaviortree.cpp")
             "-DBTCPP_BUILD_TOOLS=" .. (package:config("tools") and "ON" or "OFF"),
             "-DUSE_VENDORED_MINITRACE=" .. (package:config("vendored") and "ON" or "OFF"),
             "-DUSE_VENDORED_TINYXML2=" .. (package:config("vendored") and "ON" or "OFF"),
-            "-DUSE_VENDORED_CPPZMQ=" .. (package:config("vendored") and "ON" or "OFF"),
+            -- Always use the vendored cppzmq. cppzmq is header-only so there is
+            -- no binary to worry about. This prevents CMake from locating an
+            -- installed cppzmq config file whose imported target carries
+            -- INTERFACE_LINK_LIBRARIES = "libzmq" (a bare name). That bare name
+            -- becomes -llibzmq on the final link line alongside the full-path
+            -- archive already provided via ZeroMQ_LIBRARY, causing LNK1181 on
+            -- Windows and "cannot find -llibzmq" on Linux.
+            "-DUSE_VENDORED_CPPZMQ=ON",
         }
 
         if package:config("groot2_interface") then
             local zeromq = package:dep("zeromq")
-            local cppzmq = package:dep("cppzmq")
             if zeromq then
                 local fetchinfo = zeromq:fetch()
                 if fetchinfo then
@@ -85,24 +92,23 @@ package("behaviortree.cpp")
                     local libfiles = fetchinfo.libfiles
                     if includedirs and #includedirs > 0 then
                         table.insert(configs, "-DZeroMQ_INCLUDE_DIRS=" .. includedirs[1])
+                        -- ZeroMQ_INCLUDE_DIR (singular) is the cache variable used by
+                        -- FindZeroMQ.cmake's short-circuit path to populate
+                        -- ZeroMQ_INCLUDE_DIRS, so set both forms.
+                        table.insert(configs, "-DZeroMQ_INCLUDE_DIR=" .. includedirs[1])
                     end
                     if libfiles and #libfiles > 0 then
                         local libfile = libfiles[1]
-                        -- ZeroMQ_LIBRARIES: output var checked by find_package_handle_standard_args
-                        -- ZeroMQ_LIBRARY: singular form used by cppzmq's imported target to set
-                        --                 INTERFACE_LINK_LIBRARIES; must be a full path or CMake
-                        --                 falls back to -l<name> which becomes -llibzmq on Linux
+                        -- Pass the full path via both variables consumed by
+                        -- FindZeroMQ.cmake.  Setting ZeroMQ_FOUND=TRUE makes the
+                        -- module take its early-exit branch (lines 16-19), which
+                        -- sets ZeroMQ_LIBRARIES = ZeroMQ_LIBRARY (full path) and
+                        -- skips the find_library() call that would otherwise fall
+                        -- back to a bare "-lzmq" / "-llibzmq" flag.
+                        table.insert(configs, "-DZeroMQ_FOUND=TRUE")
                         table.insert(configs, "-DZeroMQ_LIBRARIES=" .. libfile)
                         table.insert(configs, "-DZeroMQ_LIBRARY=" .. libfile)
                     end
-                end
-            end
-            -- Point find_package(cppzmq) at the xmake-installed config dir so the
-            -- imported target cppzmq-static/cppzmq gets fully resolved with paths
-            if cppzmq then
-                local installdir = cppzmq:installdir()
-                if installdir then
-                    table.insert(configs, "-Dcppzmq_DIR=" .. path.join(installdir, "share", "cmake", "cppzmq"))
                 end
             end
         end
